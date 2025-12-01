@@ -597,6 +597,64 @@ async def summary(ctx):
     await ctx.send(embed=embed)
 
 
+@bot.command(name='undo', help='Undo the last transaction or allocation')
+async def undo_last(ctx):
+    """Undo the most recent transaction or allocation"""
+    data = load_data()
+
+    # Check if there are any transactions
+    if data['transactions']:
+        # Remove the last transaction
+        last_transaction = data['transactions'].pop()
+        save_data(data)
+
+        bucket = data['buckets'].get(last_transaction['bucket'], {})
+        await ctx.send(f"✅ Undone: ${abs(last_transaction['amount']):.2f} from {last_transaction['bucket']} {bucket.get('name', 'Unknown')}")
+        return
+
+    # Check if there are any recent allocations (look at buckets with allocated > 0)
+    # Since we don't track allocation history, we can't undo allocations automatically
+    # User would need to manually adjust with negative allocation
+
+    await ctx.send("❌ No transactions to undo. To undo an allocation, you'll need to manually adjust it.")
+
+
+@bot.command(name='adjust', help='Adjust allocation for a bucket. Usage: !adjust <emote> <amount>')
+async def adjust_allocation(ctx, emote: str, amount: float):
+    """Manually adjust the allocated amount for a bucket (can be negative to reduce)"""
+    data = load_data()
+
+    if emote not in data['buckets']:
+        await ctx.send(f"❌ Unknown bucket: {emote}. Use `!buckets` to see all categories.")
+        return
+
+    bucket = data['buckets'][emote]
+    old_allocated = bucket.get('allocated', 0.0)
+    new_allocated = old_allocated + amount
+
+    if new_allocated < 0:
+        await ctx.send(f"❌ Can't adjust: would result in negative allocation (${new_allocated:.2f})")
+        return
+
+    bucket['allocated'] = new_allocated
+    data['buckets'][emote] = bucket
+    save_data(data)
+
+    unallocated = get_unallocated(data)
+
+    embed = discord.Embed(
+        title=f"{emote} {bucket['name']}",
+        description=f"✅ Adjusted allocation",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Previous", value=f"${old_allocated:.2f}", inline=True)
+    embed.add_field(name="Adjustment", value=f"{'+' if amount > 0 else ''}${amount:.2f}", inline=True)
+    embed.add_field(name="New Total", value=f"${new_allocated:.2f}", inline=True)
+    embed.add_field(name="💰 Unallocated", value=f"${unallocated:.2f}", inline=False)
+
+    await ctx.send(embed=embed)
+
+
 @bot.command(name='clear', help='Clear all data (use with caution!)')
 async def clear_data(ctx):
     """Clear all budget data"""
