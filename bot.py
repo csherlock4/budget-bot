@@ -267,9 +267,14 @@ async def list_buckets(ctx):
     """List all buckets with allocated, spent, and available amounts"""
     data = load_data()
 
-    if not data['buckets']:
+    print(f"DEBUG: buckets command called, found {len(data.get('buckets', {}))} buckets")
+
+    if not data.get('buckets'):
+        print("DEBUG: No buckets found, sending error message")
         await ctx.send('No buckets set up yet. Use `!setbucket <emote> <name> <amount>` to create one.')
         return
+
+    print("DEBUG: Buckets found, building embed")
 
     embed = discord.Embed(title="💰 Budget Envelopes", color=discord.Color.green())
 
