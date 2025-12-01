@@ -236,8 +236,9 @@ class CategorySelectView(ui.View):
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    print(f'Budget tracking active in channel ID: {BUDGET_CHANNEL_ID}')
+    print(f'{bot.user} has connected to Discord!', flush=True)
+    print(f'Budget tracking active in channel ID: {BUDGET_CHANNEL_ID}', flush=True)
+    print(f'Bot ready at {datetime.now()}', flush=True)
 
 
 @bot.command(name='setbucket', help='Set a budget bucket. Usage: !setbucket <emote> <name> <amount>')
