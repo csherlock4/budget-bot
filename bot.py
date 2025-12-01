@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from discord import ui
 import json
 import os
 from datetime import datetime
@@ -18,6 +19,9 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # Data file path
 DATA_FILE = 'data.json'
 
+# Store pending transactions (amount waiting for category selection)
+pending_transactions = {}
+
 
 def load_data():
     """Load budget data from JSON file"""
@@ -33,6 +37,203 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 
+def get_total_income(data):
+    """Calculate total income"""
+    if 'income' not in data:
+        return 0.0
+    return sum(i['amount'] for i in data['income'])
+
+
+def get_total_allocated(data):
+    """Calculate total allocated across all buckets"""
+    return sum(bucket.get('allocated', 0.0) for bucket in data['buckets'].values())
+
+
+def get_unallocated(data):
+    """Calculate unallocated funds (income - allocated)"""
+    return get_total_income(data) - get_total_allocated(data)
+
+
+def get_spent(data, emote):
+    """Calculate total spent from a bucket"""
+    return sum(
+        abs(t['amount']) for t in data['transactions']
+        if t['bucket'] == emote and t['amount'] < 0
+    )
+
+
+def get_available(data, emote):
+    """Calculate available balance in a bucket (allocated - spent)"""
+    bucket = data['buckets'].get(emote, {})
+    allocated = bucket.get('allocated', 0.0)
+    spent = get_spent(data, emote)
+    return allocated - spent
+
+
+def find_bucket_by_name(data, name):
+    """Find a bucket by partial name match (case insensitive)"""
+    name_lower = name.lower()
+
+    # First try exact match
+    for emote, bucket in data['buckets'].items():
+        if bucket['name'].lower() == name_lower:
+            return emote, bucket
+
+    # Then try partial match
+    for emote, bucket in data['buckets'].items():
+        if name_lower in bucket['name'].lower():
+            return emote, bucket
+
+    return None, None
+
+
+class CategorySelectView(ui.View):
+    """Interactive view for selecting a transaction category"""
+
+    def __init__(self, user_id, amount, original_message):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.user_id = user_id
+        self.amount = amount
+        self.original_message = original_message
+
+        # Load buckets and create buttons
+        data = load_data()
+
+        # Create buttons for each bucket (max 25 buttons per view)
+        # For spending, show available balance and style accordingly
+        for emote, bucket in list(data['buckets'].items())[:25]:
+            available = get_available(data, emote)
+
+            # Determine button style based on available balance (only for spending)
+            if self.amount < 0:  # Spending
+                if available < 0:
+                    style = discord.ButtonStyle.secondary  # Gray - overspent
+                    label = f"{bucket['name']} (-${abs(available):.0f})"
+                elif available == 0:
+                    style = discord.ButtonStyle.secondary  # Gray - empty
+                    label = f"{bucket['name']} ($0)"
+                elif available < abs(self.amount):
+                    style = discord.ButtonStyle.danger  # Red - insufficient funds for this purchase
+                    label = f"{bucket['name']} (${available:.0f})"
+                else:
+                    style = discord.ButtonStyle.success  # Green - sufficient funds
+                    label = f"{bucket['name']} (${available:.0f})"
+            else:  # Allocation
+                style = discord.ButtonStyle.primary
+                label = f"{bucket['name']}"
+
+            button = ui.Button(
+                label=label,
+                emoji=emote,
+                style=style
+            )
+            button.callback = self.create_callback(emote, bucket['name'])
+            self.add_item(button)
+
+    def create_callback(self, emote, bucket_name):
+        """Create a callback function for each button"""
+        async def callback(interaction: discord.Interaction):
+            # Verify it's the right user
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message("This isn't your transaction!", ephemeral=True)
+                return
+
+            data = load_data()
+            bucket = data['buckets'][emote]
+
+            # Handle allocation vs spending
+            if self.amount > 0:
+                # This is an allocation - add to bucket's allocated amount
+                bucket['allocated'] = bucket.get('allocated', 0.0) + self.amount
+                data['buckets'][emote] = bucket
+                save_data(data)
+
+                allocated = bucket['allocated']
+                target = bucket['target']
+                percentage = (allocated / target * 100) if target > 0 else 0
+
+                embed = discord.Embed(
+                    title=f"{emote} {bucket['name']}",
+                    description=f"✅ Allocated ${self.amount:.2f}",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="Total Allocated", value=f"${allocated:.2f}", inline=True)
+                embed.add_field(name="Target", value=f"${target:.2f} ({percentage:.0f}%)", inline=True)
+
+                unallocated = get_unallocated(data)
+                embed.add_field(name="💰 Unallocated Remaining", value=f"${unallocated:.2f}", inline=False)
+
+                await interaction.response.edit_message(
+                    content=f"✅ Allocated ${self.amount:.2f} to {emote} {bucket_name}",
+                    view=None,
+                    embed=embed
+                )
+            else:
+                # This is spending - record transaction
+                available_before = get_available(data, emote)
+
+                transaction = {
+                    'date': datetime.now().isoformat(),
+                    'bucket': emote,
+                    'amount': self.amount,
+                    'description': 'Quick transaction',
+                    'message_id': self.original_message.id,
+                    'cc_purchase': False
+                }
+
+                data['transactions'].append(transaction)
+                save_data(data)
+
+                # Calculate envelope balances
+                allocated = bucket.get('allocated', 0.0)
+                spent = get_spent(data, emote)
+                available = allocated - spent
+
+                # Determine status and color
+                if available < 0:
+                    status = f"⚠️ OVERSPENT by ${abs(available):.2f}!"
+                    color = discord.Color.red()
+                elif available == 0:
+                    status = f"💸 Envelope empty"
+                    color = discord.Color.orange()
+                elif available < allocated * 0.25:
+                    status = f"🟡 Running low"
+                    color = discord.Color.gold()
+                else:
+                    status = f"✅ On track"
+                    color = discord.Color.green()
+
+                embed = discord.Embed(
+                    title=f"{emote} {bucket['name']}",
+                    description=status,
+                    color=color
+                )
+                embed.add_field(name="This Expense", value=f"${abs(self.amount):.2f}", inline=False)
+                embed.add_field(name="Allocated", value=f"${allocated:.2f}", inline=True)
+                embed.add_field(name="Spent", value=f"${spent:.2f}", inline=True)
+                embed.add_field(name="Available", value=f"${available:.2f}", inline=True)
+
+                # Add warning if overspent
+                if available_before >= 0 and available < 0:
+                    embed.add_field(
+                        name="⚠️ Warning",
+                        value=f"This purchase put you ${abs(available):.2f} over budget!",
+                        inline=False
+                    )
+
+                await interaction.response.edit_message(
+                    content=f"✅ Spent ${abs(self.amount):.2f} from {emote} {bucket_name}",
+                    view=None,
+                    embed=embed
+                )
+
+            # Clean up pending transaction
+            if self.user_id in pending_transactions:
+                del pending_transactions[self.user_id]
+
+        return callback
+
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
@@ -44,84 +245,83 @@ async def set_bucket(ctx, emote: str, name: str, amount: float):
     """Set or update a budget bucket with an emote, name, and target amount"""
     data = load_data()
 
+    # Preserve allocated amount if bucket already exists
+    existing_allocated = 0.0
+    if emote in data['buckets']:
+        existing_allocated = data['buckets'][emote].get('allocated', 0.0)
+
     # Store bucket info with emote as key
     data['buckets'][emote] = {
         'name': name,
         'target': amount,
-        'emote': emote
+        'emote': emote,
+        'allocated': existing_allocated
     }
 
     save_data(data)
     await ctx.send(f'✅ Bucket set: {emote} **{name}** - Target: ${amount:.2f}')
 
 
-@bot.command(name='buckets', help='List all budget buckets and their status')
+@bot.command(name='buckets', help='List all budget buckets (envelopes) and their status')
 async def list_buckets(ctx):
-    """List all buckets with current balance and goal progress"""
+    """List all buckets with allocated, spent, and available amounts"""
     data = load_data()
 
     if not data['buckets']:
         await ctx.send('No buckets set up yet. Use `!setbucket <emote> <name> <amount>` to create one.')
         return
 
-    embed = discord.Embed(title="💰 Budget Buckets", color=discord.Color.green())
+    embed = discord.Embed(title="💰 Budget Envelopes", color=discord.Color.green())
+
+    # Add unallocated summary
+    total_income = get_total_income(data)
+    total_allocated = get_total_allocated(data)
+    unallocated = get_unallocated(data)
+
+    if total_income > 0:
+        embed.description = f"💵 Income: ${total_income:.2f} | 💰 Unallocated: ${unallocated:.2f}"
 
     for emote, bucket in data['buckets'].items():
         name = bucket['name']
-        limit_or_goal = bucket['target']
+        target = bucket['target']
+        allocated = bucket.get('allocated', 0.0)
+        spent = get_spent(data, emote)
+        available = allocated - spent
 
-        # Calculate current balance (deposits - withdrawals)
-        balance = sum(
-            t['amount'] for t in data['transactions']
-            if t['bucket'] == emote
-        )
-
-        # Check if this is a credit card bucket
-        is_credit_card = name.lower() == 'creditcard'
-
-        if is_credit_card:
-            # For credit cards: show debt (negative balance) and available credit
-            debt = abs(balance)  # Debt is the negative of balance
-            available_credit = limit_or_goal - debt
-            utilization = (debt / limit_or_goal * 100) if limit_or_goal > 0 else 0
-
-            # Color code based on credit utilization
-            if utilization > 90:
-                status_emoji = '❌'
-                color_indicator = 'red'
-            elif utilization > 50:
-                status_emoji = '🟡'
-                color_indicator = 'yellow'
-            else:
-                status_emoji = '✅'
-                color_indicator = 'green'
-
-            embed.add_field(
-                name=f"{emote} {name}",
-                value=f"Debt: ${debt:.2f}\nLimit: ${limit_or_goal:.2f}\nAvailable: ${available_credit:.2f} ({utilization:.1f}% used)\n{status_emoji}",
-                inline=True
-            )
+        # Determine status emoji
+        if allocated == 0:
+            status_emoji = '⚪'  # Not funded
+            status_text = "Not allocated"
+        elif available < 0:
+            status_emoji = '❌'  # Overspent
+            status_text = f"OVERSPENT ${abs(available):.2f}"
+        elif available == 0:
+            status_emoji = '💸'  # Empty
+            status_text = "Empty"
+        elif available < allocated * 0.25:
+            status_emoji = '🟡'  # Running low
+            status_text = f"${available:.2f} left"
         else:
-            # Regular savings bucket
-            percentage = (balance / limit_or_goal * 100) if limit_or_goal > 0 else 0
-            remaining_to_goal = limit_or_goal - balance
+            status_emoji = '✅'  # Good
+            status_text = f"${available:.2f} left"
 
-            # Color code based on progress
-            if balance >= limit_or_goal:
-                status_emoji = '✅'
-                status_text = f"Goal reached! ${balance - limit_or_goal:.2f} over"
-            elif percentage >= 75:
-                status_emoji = '🟡'
-                status_text = f"${remaining_to_goal:.2f} to goal"
-            else:
-                status_emoji = '🔵'
-                status_text = f"${remaining_to_goal:.2f} to goal"
+        # Build field value
+        value_parts = []
+        if allocated > 0:
+            value_parts.append(f"Allocated: ${allocated:.2f}")
+            value_parts.append(f"Spent: ${spent:.2f}")
+            value_parts.append(f"Available: ${available:.2f}")
+        else:
+            value_parts.append(f"Target: ${target:.2f}")
+            value_parts.append("(not yet allocated)")
 
-            embed.add_field(
-                name=f"{emote} {name}",
-                value=f"Balance: ${balance:.2f}\nGoal: ${limit_or_goal:.2f} ({percentage:.1f}%)\n{status_emoji} {status_text}",
-                inline=True
-            )
+        value_parts.append(f"{status_emoji} {status_text}")
+
+        embed.add_field(
+            name=f"{emote} {name}",
+            value="\n".join(value_parts),
+            inline=True
+        )
 
     await ctx.send(embed=embed)
 
@@ -155,6 +355,10 @@ async def add_income(ctx, amount: float, *, description: str = "Income"):
     # Calculate overall total income
     overall_total = sum(i['amount'] for i in data['income'])
 
+    # Calculate unallocated funds
+    unallocated = get_unallocated(data)
+    allocated = get_total_allocated(data)
+
     embed = discord.Embed(
         title=f"💵 Income Recorded",
         description=f"**${amount:.2f}** - {description}",
@@ -162,6 +366,14 @@ async def add_income(ctx, amount: float, *, description: str = "Income"):
     )
     embed.add_field(name=f"{ctx.author.name}'s Total Income", value=f"${person_total:.2f}", inline=True)
     embed.add_field(name="Combined Income", value=f"${overall_total:.2f}", inline=True)
+    embed.add_field(name="💰 Unallocated", value=f"${unallocated:.2f}", inline=False)
+
+    if unallocated > 0:
+        embed.add_field(
+            name="💡 Next Step",
+            value=f"Allocate funds to envelopes! Type `+<amount> <category>` (e.g., `+600 groceries`)",
+            inline=False
+        )
 
     await ctx.send(embed=embed)
 
@@ -248,64 +460,66 @@ async def history(ctx, emote: str = None):
 async def list_commands(ctx):
     """Display all available commands with descriptions"""
     embed = discord.Embed(
-        title="📋 Budget Bot Commands",
-        description="Here are all available commands:",
+        title="📋 Envelope Budget Bot",
+        description="Simple envelope budgeting system. Track income, allocate to envelopes, and spend!",
         color=discord.Color.purple()
     )
 
     embed.add_field(
-        name="🏦 Setup & Management",
+        name="🏦 Setup",
         value=(
-            "`!setbucket <emote> <name> <amount>` - Create/update a budget bucket\n"
-            "Example: `!setbucket 💰 home 5000`\n\n"
-            "`!buckets` - View all buckets with balances and goals\n\n"
+            "`!setbucket <emote> <name> <target>` - Create/update an envelope\n"
+            "Example: `!setbucket 🥕 groceries 600`\n\n"
+            "`!buckets` - View all envelopes and their status\n\n"
             "`!clear` - Clear all data (use with caution!)"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="💵 Income Tracking",
+        name="💵 Step 1: Record Income",
         value=(
-            "`!income <amount> <description>` - Record income earned\n"
-            "Example: `!income 3000 November paycheck`\n\n"
-            "`!incomehistory [person]` - View income history (optional: filter by person)\n"
-            "Example: `!incomehistory` or `!incomehistory Cassandra`"
+            "`!income <amount> <description>` - Record income\n"
+            "Example: `!income 3000 paycheck`\n\n"
+            "Shows your unallocated funds after recording."
         ),
         inline=False
     )
 
     embed.add_field(
-        name="💰 Transaction Tracking",
+        name="💰 Step 2: Allocate to Envelopes",
         value=(
-            "**In budget channel, use format:** `<emote> <amount> <description> [CC]`\n"
-            "• Positive amount = deposit to bucket\n"
-            "• Negative amount = withdrawal from bucket\n"
-            "• Add 'CC' at end for credit card purchases\n\n"
+            "**Quick allocation:** `+<amount> <category>`\n"
             "Examples:\n"
-            "`💰 2000 paycheck deposit`\n"
-            "`💰 -100 groceries CC`\n"
-            "`💳 500 credit card payment`"
+            "`+600 groceries` - Allocate $600 to groceries envelope\n"
+            "`+150 gas` - Allocate $150 to gas\n"
+            "`+920 mortgage` - Allocate $920 to mortgage\n\n"
+            "Fuzzy matching works! `+600 groc` finds groceries."
         ),
         inline=False
     )
 
     embed.add_field(
-        name="📊 Reports & History",
+        name="💸 Step 3: Spend from Envelopes",
         value=(
-            "`!summary` - Overall financial summary (income, savings, debt)\n\n"
-            "`!history [emote]` - View transaction history (optional: filter by bucket)\n"
-            "Example: `!history` or `!history 💰`"
+            "**Quick spending:** Just type `-<amount>`\n"
+            "Examples:\n"
+            "`-28` - Bot shows category buttons with available balances\n"
+            "`-150` - Click the envelope to spend from\n\n"
+            "Buttons are color-coded:\n"
+            "• Green = enough funds\n"
+            "• Red = insufficient funds (warns if overspent)\n"
+            "• Gray = empty envelope"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="💳 Credit Card Tips",
+        name="📊 Reports",
         value=(
-            "• Name a bucket 'CreditCard' to track as debt\n"
-            "• Add 'CC' to transactions to dual-track (deduct from bucket + add to CC debt)\n"
-            "• CC buckets show debt/limit instead of balance/goal"
+            "`!summary` - Envelope budget overview\n"
+            "`!history [emote]` - Transaction history\n"
+            "`!incomehistory [person]` - Income history"
         ),
         inline=False
     )
@@ -313,82 +527,66 @@ async def list_commands(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command(name='summary', help='View overall financial summary including income')
+@bot.command(name='summary', help='View overall financial summary (envelope budget)')
 async def summary(ctx):
-    """Show summary of income and spending by person"""
+    """Show summary of income, allocations, and spending"""
     data = load_data()
 
-    embed = discord.Embed(title="📊 Financial Summary", color=discord.Color.blue())
+    embed = discord.Embed(title="📊 Envelope Budget Summary", color=discord.Color.blue())
 
     # Income summary
-    if 'income' in data and data['income']:
-        total_income = sum(i['amount'] for i in data['income'])
+    total_income = get_total_income(data)
 
+    if total_income > 0:
         # Group by person
         people = {}
-        for i in data['income']:
+        for i in data.get('income', []):
             person = i['person']
             if person not in people:
                 people[person] = 0
             people[person] += i['amount']
 
-        income_text = f"**Combined Total:** ${total_income:.2f}\n"
+        income_text = f"**Total:** ${total_income:.2f}\n"
         for person, amount in people.items():
             income_text += f"• {person}: ${amount:.2f}\n"
 
         embed.add_field(name="💵 Income", value=income_text, inline=False)
     else:
-        embed.add_field(name="💵 Income", value="No income recorded yet", inline=False)
+        embed.add_field(name="💵 Income", value="No income recorded yet. Use `!income <amount> <description>`", inline=False)
 
-    # Bucket summary
+    # Envelope summary
     if data['buckets']:
-        total_saved = 0
-        total_goals = 0
-        cc_debt = 0
+        total_allocated = get_total_allocated(data)
+        total_spent = sum(get_spent(data, emote) for emote in data['buckets'].keys())
+        total_available = total_allocated - total_spent
+        unallocated = get_unallocated(data)
 
+        envelope_text = f"**Allocated:** ${total_allocated:.2f}\n"
+        envelope_text += f"**Spent:** ${total_spent:.2f}\n"
+        envelope_text += f"**Available:** ${total_available:.2f}\n"
+        envelope_text += f"**Unallocated:** ${unallocated:.2f}"
+
+        # Add warning if over-allocated
+        if unallocated < 0:
+            envelope_text += f"\n⚠️ Over-allocated by ${abs(unallocated):.2f}!"
+
+        embed.add_field(name="💰 Envelopes", value=envelope_text, inline=False)
+
+        # Show overspent envelopes
+        overspent = []
         for emote, bucket in data['buckets'].items():
-            balance = sum(
-                t['amount'] for t in data['transactions']
-                if t['bucket'] == emote
+            available = get_available(data, emote)
+            if available < 0:
+                overspent.append(f"{emote} {bucket['name']}: ${abs(available):.2f} over")
+
+        if overspent:
+            embed.add_field(
+                name="⚠️ Overspent Envelopes",
+                value="\n".join(overspent),
+                inline=False
             )
-
-            if bucket['name'].lower() == 'creditcard':
-                cc_debt += abs(balance)
-            else:
-                total_saved += balance
-                total_goals += bucket['target']
-
-        buckets_text = f"**Total Saved:** ${total_saved:.2f}\n"
-        buckets_text += f"**Total Goals:** ${total_goals:.2f}\n"
-        if cc_debt > 0:
-            buckets_text += f"**CC Debt:** ${cc_debt:.2f}"
-
-        embed.add_field(name="💰 Buckets", value=buckets_text, inline=False)
     else:
-        embed.add_field(name="💰 Buckets", value="No buckets set up yet", inline=False)
-
-    # Net worth (if income exists)
-    if 'income' in data and data['income']:
-        total_income = sum(i['amount'] for i in data['income'])
-        total_saved = sum(
-            sum(t['amount'] for t in data['transactions'] if t['bucket'] == emote)
-            for emote, bucket in data['buckets'].items()
-            if bucket['name'].lower() != 'creditcard'
-        )
-        cc_debt = sum(
-            abs(sum(t['amount'] for t in data['transactions'] if t['bucket'] == emote))
-            for emote, bucket in data['buckets'].items()
-            if bucket['name'].lower() == 'creditcard'
-        )
-
-        net_position = total_saved - cc_debt
-        unallocated = total_income - total_saved - cc_debt
-
-        embed.add_field(
-            name="📈 Overall",
-            value=f"**Net Position:** ${net_position:.2f}\n**Unallocated Funds:** ${unallocated:.2f}",
-            inline=False
-        )
+        embed.add_field(name="💰 Envelopes", value="No envelopes set up yet", inline=False)
 
     await ctx.send(embed=embed)
 
@@ -416,6 +614,91 @@ async def on_message(message):
     # Skip if it's a command
     if message.content.startswith('!'):
         return
+
+    # Check for quick transaction format (just a number like "-28" or "+99" or "150")
+    content = message.content.strip()
+    try:
+        amount = float(content)
+        # It's a quick transaction! Show category selection
+        data = load_data()
+
+        if not data['buckets']:
+            await message.reply("❌ No buckets set up yet. Use `!setbucket` to create categories first.")
+            return
+
+        # Store pending transaction
+        pending_transactions[message.author.id] = {
+            'amount': amount,
+            'message': message
+        }
+
+        # Create and send category selection view
+        view = CategorySelectView(message.author.id, amount, message)
+
+        transaction_type = "deposit" if amount > 0 else "expense"
+        embed = discord.Embed(
+            title=f"💰 ${abs(amount):.2f} {transaction_type}",
+            description="Select a category for this transaction:",
+            color=discord.Color.blue()
+        )
+
+        await message.reply(embed=embed, view=view)
+        return
+    except ValueError:
+        # Not a simple number, continue to regular transaction parsing
+        pass
+
+    # Check for allocation format (+amount category)
+    if content.startswith('+'):
+        parts = content.split(maxsplit=1)
+        if len(parts) >= 2:
+            try:
+                amount = float(parts[0])  # Will include the +
+                category_name = parts[1]
+
+                data = load_data()
+
+                # Find the bucket by name
+                emote, bucket = find_bucket_by_name(data, category_name)
+
+                if not bucket:
+                    await message.reply(f"❌ Couldn't find a bucket matching '{category_name}'. Use `!buckets` to see all categories.")
+                    return
+
+                # Check if there are unallocated funds
+                unallocated = get_unallocated(data)
+
+                # Allocate the funds
+                bucket['allocated'] = bucket.get('allocated', 0.0) + amount
+                data['buckets'][emote] = bucket
+                save_data(data)
+
+                allocated = bucket['allocated']
+                target = bucket['target']
+                percentage = (allocated / target * 100) if target > 0 else 0
+                new_unallocated = get_unallocated(data)
+
+                embed = discord.Embed(
+                    title=f"{emote} {bucket['name']}",
+                    description=f"✅ Allocated ${amount:.2f}",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="Total Allocated", value=f"${allocated:.2f}", inline=True)
+                embed.add_field(name="Target", value=f"${target:.2f} ({percentage:.0f}%)", inline=True)
+                embed.add_field(name="💰 Unallocated Remaining", value=f"${new_unallocated:.2f}", inline=False)
+
+                if new_unallocated < 0:
+                    embed.add_field(
+                        name="⚠️ Warning",
+                        value=f"You've over-allocated by ${abs(new_unallocated):.2f}! You don't have enough income to cover all allocations.",
+                        inline=False
+                    )
+
+                await message.reply(embed=embed)
+                return
+            except ValueError:
+                # Not a valid allocation format, continue
+                pass
 
     # Try to parse transaction format: <emote> <amount> <description>
     parts = message.content.split(maxsplit=2)
