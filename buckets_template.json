@@ -1,0 +1,23 @@
+{
+  "💳": {"name": "CreditCard", "target": 5000.0, "emote": "💳"},
+  "🏠": {"name": "mortgage", "target": 920.0, "emote": "🏠"},
+  "💡": {"name": "utilities", "target": 800.0, "emote": "💡"},
+  "🌯": {"name": "lunches", "target": 100.0, "emote": "🌯"},
+  "🩹": {"name": "healthcare", "target": 200.0, "emote": "🩹"},
+  "🍜": {"name": "eatingout", "target": 200.0, "emote": "🍜"},
+  "🤮": {"name": "studentloan", "target": 60.0, "emote": "🤮"},
+  "🧶": {"name": "hobbies", "target": 150.0, "emote": "🧶"},
+  "🫣": {"name": "taxes", "target": 1500.0, "emote": "🫣"},
+  "🧓": {"name": "retirement", "target": 500.0, "emote": "🧓"},
+  "🧺": {"name": "emergency", "target": 250.0, "emote": "🧺"},
+  "💩": {"name": "shithappens", "target": 250.0, "emote": "💩"},
+  "🪣": {"name": "savings", "target": 1300.0, "emote": "🪣"},
+  "🟣": {"name": "twitch", "target": 40.0, "emote": "🟣"},
+  "👾": {"name": "work", "target": 40.0, "emote": "👾"},
+  "🚙": {"name": "car", "target": 300.0, "emote": "🚙"},
+  "⛽": {"name": "gas", "target": 150.0, "emote": "⛽"},
+  "💸": {"name": "cardpayments", "target": 800.0, "emote": "💸"},
+  "🥕": {"name": "groceries", "target": 600.0, "emote": "🥕"},
+  "🔧": {"name": "repairs", "target": 5000.0, "emote": "🔧"},
+  "🐱": {"name": "cats", "target": 200.0, "emote": "🐱"}
+}

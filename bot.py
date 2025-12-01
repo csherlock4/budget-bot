@@ -27,8 +27,34 @@ def load_data():
     """Load budget data from JSON file"""
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    return {'buckets': {}, 'transactions': []}
+            data = json.load(f)
+            # If buckets are empty, initialize from template
+            if not data.get('buckets'):
+                data['buckets'] = load_bucket_template()
+                save_data(data)
+            return data
+
+    # Create new data file from template
+    data = {
+        'buckets': load_bucket_template(),
+        'transactions': [],
+        'income': []
+    }
+    save_data(data)
+    return data
+
+
+def load_bucket_template():
+    """Load bucket definitions from template file"""
+    template_file = 'buckets_template.json'
+    if os.path.exists(template_file):
+        with open(template_file, 'r') as f:
+            buckets = json.load(f)
+            # Add allocated field to each bucket
+            for emote, bucket in buckets.items():
+                bucket['allocated'] = 0.0
+            return buckets
+    return {}
 
 
 def save_data(data):
